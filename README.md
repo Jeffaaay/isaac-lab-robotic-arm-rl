@@ -1,82 +1,119 @@
-# SO-ARM101 Reinforcement Learning
+# SO-ARM101 强化学习
 
-Training a 6-DOF robotic arm to reach arbitrary 3D targets using PPO in NVIDIA Isaac Lab.
+用 PPO 在 NVIDIA Isaac Lab 里训练一个 6 自由度机械臂去碰随机的 3D 目标点。
 
-## Overview
+## 简介
 
-This project trains the [SO-ARM101](https://github.com/TheRobotStudio/SO-ARM100) robotic arm entirely in simulation using reinforcement learning. The arm learns to move its end effector to random XYZ target positions — no hardcoded trajectories, no inverse kinematics. The policy discovers joint coordination purely from trial and error across 512 parallel environments.
+这个项目完全在仿真里用强化学习训练 [SO-ARM101](https://github.com/TheRobotStudio/SO-ARM100) 机械臂。机械臂学会把末端执行器移动到随机的 XYZ 目标位置——没有写死的轨迹，没有逆运动学。策略纯粹靠 512 个并行环境的反复试错来学习关节协调。
 
-**Stack:** Isaac Lab 2.7.0 · Isaac Sim 5.1.0 · rsl_rl (PPO) · PyTorch · NVIDIA PhysX
+**技术栈：** Isaac Lab 2.7.0 · Isaac Sim 5.1.0 · rsl_rl (PPO) · PyTorch · NVIDIA PhysX
 
-## Architecture
+## 架构
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  Isaac Lab   │────▶│  PPO Policy  │────▶│  Joint      │
-│  Environment │     │  (Actor-     │     │  Position   │
-│  512 parallel│◀────│   Critic)    │◀────│  Targets    │
-│  arms        │ obs │  [256,128,64]│ act │             │
+│  Isaac Lab   │────▶│  PPO 策略    │────▶│  关节位置    │
+│  环境        │     │  (Actor-     │     │  目标        │
+│  512个并行   │◀────│   Critic)    │◀────│             │
+│  机械臂      │ obs │  [256,128,64]│ act │             │
 └─────────────┘     └──────────────┘     └─────────────┘
 ```
 
-**Observations (16):** joint positions (normalized), joint velocities, end-effector-to-target vector, distance to target
+**观测 (22维)：** 关节位置（归一化）、关节速度、末端执行器位置（局部坐标）、目标位置（局部坐标）、末端到目标的向量、距离
 
-**Actions (6):** joint position targets mapped from [-1, 1] to joint limits
+**动作 (6维)：** 关节位置目标，从 [-1, 1] 映射到关节限位
 
-**Reward:** `0.1 × (1 - tanh(5 × distance))` + close bonus (< 1cm) + action smoothness penalty
+**奖励：** `0.1 × (1 - tanh(5 × distance))` + 接近奖励 (< 1cm) + 动作平滑惩罚
 
-## Results
+## 关键设计决策
 
-| Run | Reward Scale | Entropy | Noise Std | Mean Reward | Notes |
-|-----|-------------|---------|-----------|-------------|-------|
-| 1   | 1.0         | 0.005   | 1.03      | 105/300     | Critic couldn't learn large values |
-| 2   | 0.1         | 0.005   | 0.72      | 28/30       | Best run — reliable reaching |
-| 3   | 0.1         | 0.001   | 0.15      | 7/30        | Premature convergence |
-| 5   | 0.1         | 0.002   | 0.30      | 5.8/30      | Policy collapse |
+### 局部坐标 vs 世界坐标
 
-Key findings:
-- **Reward scaling matters** — the critic learns better predicting 0–30 than 0–300
-- **Entropy coefficient is critical** — too high (0.005) keeps noise elevated, too low (0.001) causes premature convergence
-- **Observation design** — removed absolute world coordinates in favor of relative features only, reducing obs from 22 to 16
+这个项目最大的教训。当你并行跑 512 个机械臂的时候，每个臂在世界坐标里的位置不一样（臂 0 在 x=0，臂 300 在 x=450）。如果你把世界坐标喂给网络，同样的任务它看到的数字完全不同。切换到**局部坐标**（减去每个臂的原点）意味着每个臂对同样的姿态看到同样的数字。光是这一个改动就把奖励从 ~15 提升到了 ~25。
 
-## Files
+```python
+# 差 — 每个臂看到不同的数字
+ee_pos = robot.data.body_pos_w  # 臂0: (0.05, 0.03, 0.12), 臂300: (450.05, 0.03, 0.12)
 
-| File | Description |
-|------|-------------|
-| `reach_env.py` | Isaac Lab DirectRLEnv — reaching task with randomized targets |
-| `train.py` | PPO training script with rsl_rl OnPolicyRunner |
-| `so101_robot_cfg.py` | Robot articulation config (joint limits, PD gains) |
-| `so101_flat.usd` | Robot USD model converted from URDF |
-| `test_mini.py` | Minimal environment test script |
-
-## Training
-
-Requires NVIDIA Isaac Lab 2.7.0+ and Isaac Sim 5.1.0.
-
-```bash
-# Train headless (fast)
-python train.py
-
-# Train with visualization (slower)
-# Set headless=False in train.py
+# 好 — 每个臂看到一样的数字
+ee_pos_local = ee_pos - scene.env_origins  # 都是: (0.05, 0.03, 0.12)
 ```
 
-Training runs 2000 iterations (~9 minutes on RTX 4060 Ti) across 512 parallel environments.
+### 奖励缩放
 
-## What I Learned
+Critic（价值函数）需要预测未来总奖励。`reward_reaching = 1.0` 跑 300 步的话，critic 要猜 0-300 之间的数。改成 `reward_reaching = 0.1` 之后范围变成 0-30。范围越小 = 越容易预测 = 学得越快。这个改动让奖励从卡在 105（假学习）变成真正学到 28。
 
-1. **PPO entropy tuning** is a balancing act — it controls the exploration/exploitation tradeoff and directly affects whether the policy converges, collapses, or gets stuck
-2. **Observation normalization** matters more than hyperparameter tuning — world-frame vs relative coordinates changed results dramatically
-3. **Reward shaping** for the critic — scaling rewards to a learnable range (0–30 vs 0–300) had more impact than network architecture changes
-4. **Sim-to-real gap** starts in simulation — getting stable training is the first bottleneck before any hardware deployment
+### 熵系数
 
-## Next Steps
+控制策略探索多少 vs 多快锁定一个策略。太高 (0.01) = 机械臂一直在探索，永远不下决心。太低 (0.001) = 机械臂太早锁定一个差策略。这个任务的甜蜜点是 0.005。
 
-- [ ] Reduced observation space (16 features, relative only) — training in progress
-- [ ] Entropy coefficient scheduling (high early → low late)
-- [ ] Domain randomization (PD gains, friction, mass)
-- [ ] Pick-and-place task built on reaching primitive
-- [ ] Sim-to-real transfer to physical SO-ARM101
+### 自碰撞
+
+开启 `enabled_self_collisions=True` 防止机械臂训练时穿过自己的身体。这样训练出来的策略更符合物理现实，而且训练曲线实际上更稳定。
+
+## 结果
+
+| 运行 | 坐标系 | 熵系数 | 奖励 | 噪声 | 备注 |
+|------|--------|-------|------|------|------|
+| 1    | 世界   | 0.005 | 105* | 1.03 | 奖励缩放太大，其实没在学 |
+| 2    | 局部   | 0.005 | ~23.5| 0.72 | 第一次好结果——局部坐标起作用了 |
+| 3    | 局部   | 0.001 | 7    | 0.15 | 熵太低，过早收敛 |
+| 5    | 局部   | 0.002 | 5.8  | 0.30 | 策略崩溃 |
+| 6    | 世界   | 0.005 | 18.8 | 0.92 | 不小心换成了世界坐标 |
+| 11   | 世界   | 0.005 | 20.3 | 0.93 | 4000次迭代，更多时间没用 |
+| 15   | 局部   | 0.005 | ~25  | —    | 改回局部坐标 |
+| 16   | 局部   | 0.005 | ~25  | —    | 开启自碰撞，曲线更稳定 |
+
+*运行1用的是 reward_reaching=1.0 不是 0.1，所以数字没法直接比较。
+
+**最佳模型：** `logs/2026-02-28_19-16-20/model_1999.pt`（运行16，局部坐标 + 自碰撞）
+
+## 文件
+
+| 文件 | 干什么的 |
+|------|---------|
+| `reach_env.py` | 环境——定义机械臂看到什么、怎么动、什么是好的 |
+| `train.py` | 用 PPO 训练 2000 次迭代，512 个臂并行 |
+| `play.py` | 加载训练好的模型，可视化看机械臂够目标 |
+| `so101_robot_cfg.py` | 机器人设置——关节限位、PD增益、自碰撞 |
+| `so101_flat.usd` | 机器人 3D 模型（从 URDF 转换） |
+
+## 训练
+
+需要 NVIDIA Isaac Lab 2.7.0+ 和 Isaac Sim 5.1.0。
+
+```bash
+# 训练（无头模式，RTX 4060 Ti 大概9分钟）
+python train.py
+
+# 看训练好的策略够目标
+python play.py
+
+# 看训练曲线
+tensorboard --logdir logs
+```
+
+## 我学到了什么
+
+1. **局部坐标 vs 世界坐标** — 最关键的因素。512个并行环境在不同的世界位置，网络没法学习，因为同样的姿态每个臂看到的数字不同。一定要减去 env_origins。
+
+2. **奖励缩放** — 保持奖励小一点，这样 critic 才能预测准。0-30 的范围可以，0-300 不行。
+
+3. **熵系数是个平衡** — 0.005 对够取任务合适。低于这个值策略太早锁定差策略，高于这个值永远不收敛。
+
+4. **RL 训练方差很大** — 同样的设置、同样的种子，不同运行的结果可能差很多，因为 GPU 浮点运算不完全确定性。别以为一次好结果就说明设置完美。
+
+5. **自碰撞很重要** — 开启后训练出的策略更符合物理，训练曲线更平滑。如果要转到真实硬件，一定要开。
+
+6. **训练时的噪声 ≠ 部署时的表现** — 训练时噪声标准差 0.7+ 在熵系数 0.005 下是正常的。评估时把噪声设成 0，机械臂就能精确够到目标。
+
+## 下一步
+
+- [ ] 抓取放置任务（抓起方块、举起来、放到目标位置）
+- [ ] 分级奖励——够取 (1x)、举起 (15x)、目标跟踪 (16x)
+- [ ] 域随机化（摩擦力、质量、电机延迟）
+- [ ] Sim-to-real 转移到真实 SO-ARM101（STS3215 舵机）
+- [ ] 五子棋棋子放置到真实棋盘上
 
 ## License
 

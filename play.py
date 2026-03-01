@@ -1,11 +1,10 @@
-"""Train SO101 reaching task with PPO."""
+"""Play trained SO101 reaching policy visually."""
 from isaacsim import SimulationApp
-app = SimulationApp({"headless": True})
+app = SimulationApp({"headless":False})
 
 import torch
 import sys
 import os
-from datetime import datetime
 
 sys.path.append("C:/dev/isaac/so101_project")
 from reach_env import SO101ReachEnv, SO101ReachEnvCfg
@@ -47,10 +46,12 @@ class RslRlWrapper:
         return ObsDict({"policy": self.obs}), rewards, dones, info
 
 
+CHECKPOINT = "C:/dev/isaac/so101_project/logs/2026-02-28_18-42-35/model_1999.pt"
+NUM_ENVS = 4
+
 cfg = SO101ReachEnvCfg()
-cfg.scene.num_envs = 512
+cfg.scene.num_envs = NUM_ENVS
 env = RslRlWrapper(SO101ReachEnv(cfg))
-print(f"Environment created: {env.num_envs} envs")
 env.reset()
 
 train_cfg = {
@@ -93,17 +94,33 @@ train_cfg = {
     "seed": 42,
 }
 
-log_dir = os.path.join(
-    "C:/dev/isaac/so101_project/logs",
-    datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-)
-os.makedirs(log_dir, exist_ok=True)
+runner = OnPolicyRunner(env, train_cfg, log_dir="/tmp/play", device="cuda:0")
 
-runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device="cuda:0")
-print(f"Training for 300 iterations...")
-print(f"Logs: {log_dir}")
+print(f"Loading checkpoint: {CHECKPOINT}")
+runner.load(CHECKPOINT)
+print(dir(runner.alg))
+# Set noise to 0 for deterministic evaluation
+with torch.no_grad():
+    runner.alg.policy.std.fill_(0.0)
+print("Noise std set to 0.0 (deterministic mode)")
 
-runner.learn(num_learning_iterations=2000, init_at_random_ep_len=True)
+obs, _ = env.reset()
+step_count = 0
+episode_count = 0
 
+print("\nWatching arms reach for red spheres...\n")
+
+while episode_count < 20:
+    with torch.no_grad():
+        actions = runner.alg.policy.act_inference(obs)
+    obs_dict, rewards, dones, info = env.step(actions)
+    obs = obs_dict
+    step_count += 1
+
+    if dones.any():
+        episode_count += dones.sum().item()
+        print(f"Episodes completed: {episode_count}/20")
+
+print("\nDone!")
 env.env.close()
 app.close()

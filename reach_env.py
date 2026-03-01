@@ -11,6 +11,7 @@ from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
+from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
 
 # Import our robot config
 import sys
@@ -27,7 +28,7 @@ class SO101ReachEnvCfg(DirectRLEnvCfg):
     decimation = 2
 
     # Task dimensions
-    num_observations = 16
+    num_observations = 22
     num_actions = 6
     episode_length_s = 5.0
 
@@ -90,6 +91,16 @@ class SO101ReachEnv(DirectRLEnv):
         # Light
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0)
         light_cfg.func("/World/light", light_cfg)
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/Visuals/targets",
+            markers={
+                "sphere": sim_utils.SphereCfg(
+                    radius=0.02,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+                ),
+            },
+        )
+        self.target_markers = VisualizationMarkers(marker_cfg)
 
         
 
@@ -120,18 +131,20 @@ class SO101ReachEnv(DirectRLEnv):
         joint_vel_scaled = joint_vel * 0.1
 
         ee_pos = self.robot.data.body_pos_w[:, self.ee_body_id[0], :]
+        ee_pos_local = ee_pos - self.scene.env_origins
+        targets_local = self.targets - self.scene.env_origins
 
-        # Local coordinates — every env sees the same scale
-        ee_to_target = self.targets - ee_pos
+        ee_to_target = targets_local - ee_pos_local
         distance = torch.norm(ee_to_target, dim=-1, keepdim=True)
 
         obs = torch.cat([
-        joint_pos_norm,      # 6 - where are my joints
-        joint_vel_scaled,    # 6 - how fast are they moving
-        ee_to_target,        # 3 - direction to target
-        distance,            # 1 - how far away
-        ], dim=-1)              # total: 16
- 
+            joint_pos_norm,      # 6
+            joint_vel_scaled,    # 6
+            ee_pos_local,        # 3
+            targets_local,       # 3
+            ee_to_target,        # 3
+            distance,            # 1
+        ], dim=-1)               # total: 22
 
         return {"policy": obs}
         
@@ -195,5 +208,8 @@ class SO101ReachEnv(DirectRLEnv):
 
         local_targets = low + (high - low) * torch.rand(num, 3, device=self.device)
         self.targets[env_ids] = local_targets + self.scene.env_origins[env_ids]
+
+        if hasattr(self, "target_markers"):
+            self.target_markers.visualize(self.targets)
 
  

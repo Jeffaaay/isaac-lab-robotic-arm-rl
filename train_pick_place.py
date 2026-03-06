@@ -1,4 +1,5 @@
-"""Train SO101 pick-and-place task with PPO."""
+"""Train SO101 pick-and-place task with PPO (rsl_rl)."""
+
 from isaacsim import SimulationApp
 app = SimulationApp({"headless": True})
 
@@ -13,12 +14,19 @@ from pick_place_env import SO101PickPlaceEnv, SO101PickPlaceEnvCfg
 from rsl_rl.runners import OnPolicyRunner
 
 
+# ─────────────────────────────────────────────
+# rsl_rl wrapper
+# ─────────────────────────────────────────────
+
 class ObsDict(dict):
+    """Dict that supports .to(device) for rsl_rl compatibility."""
     def to(self, device):
         return ObsDict({k: v.to(device) for k, v in self.items()})
 
 
 class RslRlWrapper:
+    """Minimal wrapper to make DirectRLEnv work with rsl_rl's OnPolicyRunner."""
+
     def __init__(self, env):
         self.env = env
         self.num_envs = env.num_envs
@@ -47,29 +55,39 @@ class RslRlWrapper:
         return ObsDict({"policy": self.obs}), rewards, dones, info
 
 
-# ── Environment ──
+# ─────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────
+
 cfg = SO101PickPlaceEnvCfg()
 cfg.scene.num_envs = 512
+
 env = RslRlWrapper(SO101PickPlaceEnv(cfg))
 print(f"Environment created: {env.num_envs} envs, {env.num_obs} obs, {env.num_actions} actions")
 env.reset()
 
-# ── PPO Config ──
-# Same proven settings from reaching, but bigger network for harder task
+
+# ─────────────────────────────────────────────
+# PPO config
+# ─────────────────────────────────────────────
+
 train_cfg = {
     "algorithm_class_name": "PPO",
     "policy_class_name": "ActorCritic",
+
+    # Rollout
     "num_steps_per_env": 24,
-    "max_iterations": 10000,      # longer — pick-and-place is harder
-    "save_interval": 100,
+    "max_iterations": 4000,
+    "save_interval": 500,
     "log_interval": 1,
+
+    # Experiment
     "experiment_name": "so101_pick_place",
     "run_name": "",
-    "resume": True,
-    "load_run": "C:/dev/isaac/so101_project/logs_pick_place/2026-03-01_16-00-57",
-    "checkpoint": 3999,
     "record_interval": -1,
     "obs_groups": {},
+
+    # Network
     "policy": {
         "class_name": "ActorCritic",
         "activation": "elu",
@@ -77,14 +95,16 @@ train_cfg = {
         "critic_hidden_dims": [256, 128, 64],
         "init_noise_std": 1.5,
     },
+
+    # PPO hyperparams
     "algorithm": {
         "class_name": "PPO",
         "clip_param": 0.2,
-        "desired_kl": 0.01,
+        "desired_kl": 0.008,
         "entropy_coef": 0.01,
         "gamma": 0.99,
         "lam": 0.95,
-        "learning_rate": 3e-4,
+        "learning_rate": 1e-4,
         "max_grad_norm": 1.0,
         "num_learning_epochs": 5,
         "num_mini_batches": 4,
@@ -92,26 +112,33 @@ train_cfg = {
         "use_clipped_value_loss": True,
         "value_loss_coef": 1.0,
     },
+
     "init_member_classes": {},
     "seed": 42,
 }
 
-log_dir = "C:/dev/isaac/so101_project/logs_pick_place/2026-03-01_16-00-57"
 
-os.makedirs(log_dir, exist_ok=True)
+# ─────────────────────────────────────────────
+# Logging — new folder per run
+# ─────────────────────────────────────────────
 
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+log_dir = f"C:/dev/isaac/so101_project/logs_pick_place/{timestamp}"
+
+
+
+#relaod previous saved point to continue training
 runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device="cuda:0")
+#runner.load("C:/dev/isaac/so101_project/logs_pick_place/2026-03-04_22-40-25/model_3999.pt")
 
-# ── Resume from checkpoint ──
-if train_cfg["resume"]:
-    checkpoint_path = os.path.join(log_dir, "model_3999.pt")
-    print(f"Loading checkpoint: {checkpoint_path}")
-    runner.load(checkpoint_path)
+
 
 print(f"Training for {train_cfg['max_iterations']} iterations...")
 print(f"Logs: {log_dir}")
+print(f"Monitor: tensorboard --logdir {log_dir}")
 
 runner.learn(num_learning_iterations=train_cfg["max_iterations"], init_at_random_ep_len=True)
 
 env.env.close()
 app.close()
+#tensorboard --logdir C:/dev/isaac/so101_project/logs_pick_place

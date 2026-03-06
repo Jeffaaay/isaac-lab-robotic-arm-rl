@@ -32,7 +32,7 @@ class SO101PickPlaceEnvCfg(DirectRLEnvCfg):
     # Task dimensions
     num_observations = 30
     num_actions = 6
-    episode_length_s = 8.0  # longer than reaching — arm needs time to grab + move
+    episode_length_s = 8.0
 
     # Scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
@@ -47,37 +47,45 @@ class SO101PickPlaceEnvCfg(DirectRLEnvCfg):
     )
 
     # Cube — 2cm blue cube, light (10 grams)
+    # Cube — 3cm blue cube, light (10 grams), high friction
     cube_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/Cube",
         spawn=sim_utils.CuboidCfg(
-            size=(0.02, 0.02, 0.02),
+            size=(0.03, 0.03, 0.03),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
             collision_props=sim_utils.CollisionPropertiesCfg(),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.5, 1.0)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.1, 0.0, 0.01)),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.1, 0.0, 0.015)),
     )
 
-    # Where the cube spawns (local coords — on the table surface)
-    cube_min = [0.05, -0.10, 0.01]
-    cube_max = [0.15, 0.10, 0.01]  # z fixed at table height
+    # ── Spawn ranges (local coords) ──
+    # TODO: update these after running workspace_map.py with Physics Inspector data
+    # Cube spawns in front of arm on table
+    # X = forward/backward from the arm base Y = left/right Z = up/down from ground
+    cube_min = [0.15, -0.08, 0.015]
+    cube_max = [0.25, 0.08, 0.015]
 
-    # Where to place the cube (local coords — elevated to force lifting)
-    goal_min = [-0.05, -0.10, 0.08]
-    goal_max = [0.10, 0.10, 0.15]
-
-    # ── Reward weights ──
-    # These are graduated: placing is worth 16x more than reaching
-    reward_reach = 1       # (1x)  get ee close to cube
-    reward_grasp = 2       # (5x)  close gripper when near cube
-    reward_lift = 1.5        # (15x) lift cube above table
-    reward_goal = 1.6        # (16x) move cube to goal position
-    reward_action_penalty = -0.0001
-
-    # Thresholds
-    grasp_dist = 0.04       # ee must be within 2.5cm of cube for grasp reward
-    lift_height = 0.04       # cube must be 4cm above start to count as "lifted"
+    # Goal spawns ABOVE the cube area (same XY, higher Z)
+    goal_min = [0.15, -0.08, 0.06]
+    goal_max = [0.25, 0.08, 0.12]
+    # ── Reward weights (tuned from SO-101 sim-to-real paper) ──
+    reward_reach = 1.0          # get ee close to cube
+    reward_grasp = 2.0          # close gripper when near cube
+    reward_lift = 5        # lift cube above table (was 15 — too weak)
+    reward_goal = 10      # move cube to goal position
+    reward_success = 20     # one-time bonus for reaching goal
+    reward_action_penalty = -0.0001   # penalize high joint velocities
+    reward_action_rate = -0.0001       # penalize jerky action changes # penalize jerky action changes
+    lift_height = 0.04      # cube must be 4cm above start to count as "lifted"
+    grasp_dist = 0.05
+    # In the env config:
+    
 
     def __post_init__(self):
         super().__post_init__()
@@ -118,6 +126,9 @@ class SO101PickPlaceEnv(DirectRLEnv):
         # Track cube start height for lift reward
         self.cube_start_z = torch.zeros(self.num_envs, device=self.device)
 
+        # Track previous action targets for action rate penalty
+        self._prev_targets = torch.zeros(self.num_envs, 6, device=self.device)
+
         # Randomize on start
         all_ids = torch.arange(self.num_envs, device=self.device)
         self._randomize_cube(all_ids)
@@ -126,20 +137,21 @@ class SO101PickPlaceEnv(DirectRLEnv):
     # ── Scene setup ──
 
     def _setup_scene(self):
-        """Add robot + cube to the scene."""
-        # Robot
+        """Add robot + cube + ground to the scene."""
         self.robot = Articulation(self.cfg.robot_cfg)
         self.scene.articulations["robot"] = self.robot
 
-        # Cube
         self.cube = RigidObject(self.cfg.cube_cfg)
         self.scene.rigid_objects["cube"] = self.cube
 
-        # Light
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0)
-        light_cfg.func("/World/light", light_cfg)
+                # Ground plane — large static collision box, top surface at z=0
+        ground_cfg = sim_utils.CuboidCfg(
+            size=(100.0, 100.0, 0.02),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.3, 0.3)),
+        )
+        ground_cfg.func("/World/ground", ground_cfg, translation=(0.0, 0.0, -0.01))
 
-        # Goal marker (green sphere)
         goal_marker_cfg = VisualizationMarkersCfg(
             prim_path="/Visuals/goals",
             markers={
@@ -150,18 +162,6 @@ class SO101PickPlaceEnv(DirectRLEnv):
             },
         )
         self.goal_markers = VisualizationMarkers(goal_marker_cfg)
-
-        # Cube marker (red sphere on cube for visibility)
-        cube_marker_cfg = VisualizationMarkersCfg(
-            prim_path="/Visuals/cube_markers",
-            markers={
-                "sphere": sim_utils.SphereCfg(
-                    radius=0.01,
-                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
-                ),
-            },
-        )
-        self.cube_markers = VisualizationMarkers(cube_marker_cfg)
 
     # ── Actions ──
 
@@ -179,7 +179,6 @@ class SO101PickPlaceEnv(DirectRLEnv):
     # ── Observations (30 dim) ──
 
     def _get_observations(self) -> dict:
-        # Joint state (includes gripper as joint 6)
         joint_pos = self.robot.data.joint_pos[:, :6]
         joint_vel = self.robot.data.joint_vel[:, :6]
 
@@ -206,84 +205,90 @@ class SO101PickPlaceEnv(DirectRLEnv):
         dist_ee_cube = torch.norm(ee_to_cube, dim=-1, keepdim=True)
         dist_cube_goal = torch.norm(cube_to_goal, dim=-1, keepdim=True)
 
-        # Cube height above its starting position (useful for lift stage)
+        # Cube height above its starting position
         cube_height = (cube_pos_local[:, 2:3] - self.cube_start_z.unsqueeze(-1))
 
         obs = torch.cat([
-            joint_pos_norm,      # 6  — where are the joints
-            joint_vel_scaled,    # 6  — how fast are they moving
-            ee_pos_local,        # 3  — where is the gripper
-            cube_pos_local,      # 3  — where is the cube
-            goal_pos_local,      # 3  — where should the cube go
-            ee_to_cube,          # 3  — vector from gripper to cube
-            cube_to_goal,        # 3  — vector from cube to goal
-            dist_ee_cube,        # 1  — how far is gripper from cube
-            dist_cube_goal,      # 1  — how far is cube from goal
-            cube_height,         # 1  — how high has the cube been lifted
+            joint_pos_norm,      # 6
+            joint_vel_scaled,    # 6
+            ee_pos_local,        # 3
+            cube_pos_local,      # 3
+            goal_pos_local,      # 3
+            ee_to_cube,          # 3
+            cube_to_goal,        # 3
+            dist_ee_cube,        # 1
+            dist_cube_goal,      # 1
+            cube_height,         # 1
         ], dim=-1)               # total: 30
 
-        # Update markers
         if hasattr(self, "goal_markers"):
             self.goal_markers.visualize(self.goals)
-        if hasattr(self, "cube_markers"):
-            self.cube_markers.visualize(self.cube.data.root_pos_w)
 
         return {"policy": obs}
 
-    # ── Rewards (graduated) ──
-
+    # ── Rewards ──
     def _get_rewards(self) -> torch.Tensor:
-        # Positions
         ee_pos = self.robot.data.body_pos_w[:, self.ee_body_id[0], :]
         cube_pos = self.cube.data.root_pos_w
 
-        # Distances
         dist_ee_cube = torch.norm(ee_pos - cube_pos, dim=-1)
         dist_cube_goal = torch.norm(cube_pos - self.goals, dim=-1)
 
-        # Gripper openness: 0 = closed, 1 = fully open
         gripper_pos = self.robot.data.joint_pos[:, 5]
         gripper_open = (gripper_pos - self.gripper_low) / (self.gripper_high - self.gripper_low)
         gripper_open = gripper_open.clamp(0, 1)
 
-        # Cube height above start
         cube_height = (cube_pos[:, 2] - self.scene.env_origins[:, 2]) - self.cube_start_z
 
-        # ── Stage 1: Reach the cube ──
-        # Always active — get the end effector close to the cube
-        reach_reward = self.cfg.reward_reach * (1.0 - torch.tanh(5.0 * dist_ee_cube))
+        # Stage 1: Reach — ONLY reward when far away (approaching=1)
+        # When close, reach reward = 0, forcing policy to earn grasp reward
+        approaching = (dist_ee_cube > 0.05).float()
+        reach_distance = 1.0 - torch.tanh(5.0 * dist_ee_cube)
+        reach_reward = self.cfg.reward_reach * reach_distance * approaching * (0.5 + 0.5 * gripper_open)
 
-        # ── Stage 2: Grasp ──
-        # When ee is near the cube, reward closing the gripper
-        near_cube = (dist_ee_cube < self.cfg.grasp_dist).float()
-        grasp_reward = self.cfg.reward_grasp * near_cube * (1.0 - gripper_open)
+        # Stage 2: Grasp — close gripper when near cube
+        very_close = (dist_ee_cube < 0.05).float()
+        grasp_reward = self.cfg.reward_grasp * very_close * (1.0 - gripper_open)
 
-        # ── Stage 3: Lift ──
-        # Reward the cube being above the table (only when gripper is mostly closed)
-        gripper_closed = (gripper_open < 0.3).float()
-        lift_reward = self.cfg.reward_lift * gripper_closed * torch.tanh(
+        # NEW Stage 2.5: Holding bonus — reward just having a grip (bridges grasp → lift)
+        gripper_closed = (gripper_open < 0.4).float()
+        holding = very_close * gripper_closed
+        hold_reward = 10.0 * holding
+
+        # Stage 3: Lift — cube must actually go up while held
+        lift_reward = self.cfg.reward_lift * holding * torch.tanh(
             5.0 * torch.clamp(cube_height, min=0.0)
         )
 
-        # ── Stage 4: Goal placement ──
-        # When cube is lifted, reward moving it toward the goal
+        # Stage 4: Goal — move held cube to goal
         cube_lifted = (cube_height > self.cfg.lift_height).float()
-        goal_reward = self.cfg.reward_goal * cube_lifted * (1.0 - torch.tanh(5.0 * dist_cube_goal))
-
-        # Action smoothness penalty
-        action_penalty = self.cfg.reward_action_penalty * torch.sum(
-            self.robot.data.joint_vel[:, :6] ** 2, dim=-1
+        goal_reward = self.cfg.reward_goal * cube_lifted * holding * (
+            1.0 - torch.tanh(5.0 * dist_cube_goal)
         )
 
-        total = reach_reward + grasp_reward + lift_reward + goal_reward + action_penalty
+        # Penalties
+        vel_penalty = self.cfg.reward_action_penalty * torch.sum(
+            self.robot.data.joint_vel[:, :6] ** 2, dim=-1
+        )
+        action_rate = torch.sum((self._targets - self._prev_targets) ** 2, dim=-1)
+        rate_penalty = self.cfg.reward_action_rate * action_rate
+        self._prev_targets = self._targets.clone()
+
+        # Success bonus
+        success = (dist_cube_goal < 0.03).float() * cube_lifted * holding
+        success_bonus = self.cfg.reward_success * success
+
+        total = (reach_reward + grasp_reward + hold_reward + 
+                lift_reward + goal_reward + success_bonus + 
+                vel_penalty + rate_penalty)
         return total
 
+        
     # ── Termination ──
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_limit = self.episode_length_buf >= self.max_episode_length
 
-        # Terminate if cube falls off the table (below ground)
         cube_pos_local = self.cube.data.root_pos_w - self.scene.env_origins
         cube_fell = cube_pos_local[:, 2] < -0.05
 
@@ -309,9 +314,12 @@ class SO101PickPlaceEnv(DirectRLEnv):
         joint_pos = torch.clamp(joint_pos, lower, upper)
 
         # Start gripper open
-        joint_pos[:, 5] = self.gripper_high * 0.8  # 80% open
+        joint_pos[:, 5] = self.gripper_high * 0.8
 
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        # Reset action rate tracking for these envs
+        self._prev_targets[env_ids] = self._targets[env_ids].clone() if hasattr(self, '_targets') else 0.0
 
         # Reset cube to random position on table
         self._randomize_cube(env_ids)
@@ -328,10 +336,8 @@ class SO101PickPlaceEnv(DirectRLEnv):
         local_pos = low + (high - low) * torch.rand(num, 3, device=self.device)
         world_pos = local_pos + self.scene.env_origins[env_ids]
 
-        # Save start height for lift reward
         self.cube_start_z[env_ids] = local_pos[:, 2]
 
-        # Write cube state — position + zero velocity
         zeros = torch.zeros(num, 3, device=self.device)
         default_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).expand(num, -1)
 

@@ -52,6 +52,8 @@ class RslRlWrapper:
         obs_dict, rewards, terminated, truncated, info = self.env.step(actions)
         self.obs = obs_dict["policy"]
         dones = terminated | truncated
+        info = dict(info)
+        info["episode"] = self.env.extras.get("log", {})
         return ObsDict({"policy": self.obs}), rewards, dones, info
 
 
@@ -76,8 +78,8 @@ train_cfg = {
     "policy_class_name": "ActorCritic",
 
     # Rollout
-    "num_steps_per_env": 24,
-    "max_iterations": 4000,
+    "num_steps_per_env": 96,
+    "max_iterations": 500,
     "save_interval": 500,
     "log_interval": 1,
 
@@ -89,12 +91,14 @@ train_cfg = {
 
     # Network
     "policy": {
-        "class_name": "ActorCritic",
-        "activation": "elu",
-        "actor_hidden_dims": [256, 128, 64],
-        "critic_hidden_dims": [256, 128, 64],
-        "init_noise_std": 1.5,
-    },
+    "class_name": "ActorCritic",
+    "activation": "elu",
+    "actor_hidden_dims": [256, 128, 64],
+    "critic_hidden_dims": [256, 128, 64],
+    "init_noise_std": 1.5,
+    "actor_obs_normalization": True,   # ← 加这个
+    "critic_obs_normalization": True,  # ← 加这个
+},
 
     # PPO hyperparams
     "algorithm": {
@@ -110,7 +114,7 @@ train_cfg = {
         "num_mini_batches": 4,
         "schedule": "adaptive",
         "use_clipped_value_loss": True,
-        "value_loss_coef": 1.0,
+        "value_loss_coef": 0.5,
     },
 
     "init_member_classes": {},
@@ -129,7 +133,7 @@ log_dir = f"C:/dev/isaac/so101_project/logs_pick_place/{timestamp}"
 
 #relaod previous saved point to continue training
 runner = OnPolicyRunner(env, train_cfg, log_dir=log_dir, device="cuda:0")
-#runner.load("C:/dev/isaac/so101_project/logs_pick_place/2026-03-04_22-40-25/model_3999.pt")
+#runner.load("C:/dev/isaac/so101_project/logs_pick_place/2026-03-09_16-53-58/model_3999.pt")
 
 
 

@@ -240,7 +240,7 @@ class SO101PickPlaceEnv(DirectRLEnv):
         # Latch ON:  dist < 0.05 AND gripper closed (open < 0.4)
         # Latch OFF: gripper wide open OR cube clearly back on table
         new_hold  = (dist_ee_cube < 0.05) & (gripper_open < 0.4)
-        drop_cond = (gripper_open > 0.6) | ((dist_ee_cube > 0.08) & (cube_height < 0.005))
+        drop_cond = (gripper_open > 0.6) | (dist_ee_cube > 0.08)
 
         self._holding_latch = torch.where(
             new_hold,
@@ -252,13 +252,13 @@ class SO101PickPlaceEnv(DirectRLEnv):
             torch.zeros_like(self._holding_latch),
             self._holding_latch
         )
-        raw_holding      = self._holding_latch.bool()
-        bootstrap_holding = raw_holding & (cube_height > 0.001)  # 1mm gate for lift_progress
-        true_holding      = raw_holding & (cube_height > 0.003)  # 3mm gate for hold/goal/success
+        raw_holding       = self._holding_latch.bool()
+        bootstrap_holding = raw_holding & (cube_height > 0.001) & (dist_ee_cube < 0.04)   # 1mm + EE nearby
+        true_holding      = raw_holding & (cube_height > 0.003) & (dist_ee_cube < 0.035)  # 3mm + EE nearby
 
         # ── Stage 2: Grasp — stop once latch triggers, force transition to lift ──
         very_close   = (dist_ee_cube < 0.05).float()
-        grasp_reward = self.cfg.reward_grasp * very_close * (1.0 - gripper_open) * (1.0 - raw_holding.float())
+        grasp_reward = self.cfg.reward_grasp * very_close * (1.0 - gripper_open)
 
         # ── Stage 2.5: Hold reward — height-conditioned, no table-top payout ──
         height_factor = torch.clamp(cube_height / 0.05, 0.0, 1.0)
@@ -285,7 +285,7 @@ class SO101PickPlaceEnv(DirectRLEnv):
         self._prev_targets = self._targets.clone()
 
         # ── Success bonus — one-time only ──
-        success     = (dist_cube_goal < 0.03) & (cube_height > self.cfg.lift_height) & true_holding
+        success     = (dist_cube_goal < 0.05) & (cube_height > self.cfg.lift_height) & true_holding
         new_success = success & (~self._success_latch.bool())
         success_bonus = self.cfg.reward_success * new_success.float()
         self._success_latch = torch.where(
@@ -297,19 +297,25 @@ class SO101PickPlaceEnv(DirectRLEnv):
         # ── Update prev height AFTER computing delta ──
         self._prev_cube_height = cube_height.clone()
 
+        # ── Body contact penalty — cube elevated but EE not nearby = rolling on body ──
+        cube_touching_body    = (cube_height > 0.01) & (dist_ee_cube > 0.06)
+        body_contact_penalty  = -2.0 * cube_touching_body.float()
+
         total = (reach_reward + grasp_reward + hold_reward +
                  lift_reward + goal_reward + success_bonus +
-                 vel_penalty + rate_penalty)
+                 vel_penalty + rate_penalty + body_contact_penalty)
 
         total = torch.clamp(total, -10.0, 30.0)
 
         self.extras["log"] = {
-            "mean_cube_height":  cube_height.mean().item(),
-            "max_cube_height":   cube_height.max().item(),
-            "raw_holding_ratio": raw_holding.float().mean().item(),
-            "holding_ratio":     true_holding.float().mean().item(),
-            "goal_reward_rate":  (goal_reward > 0).float().mean().item(),
-            "success_rate":      new_success.float().mean().item(),
+            "mean_cube_height":   cube_height.mean().item(),
+            "max_cube_height":    cube_height.max().item(),
+            "raw_holding_ratio":  raw_holding.float().mean().item(),
+            "holding_ratio":      true_holding.float().mean().item(),
+            "ee_cube_dist":       dist_ee_cube.mean().item(),
+            "goal_reward_rate":   (goal_reward > 0).float().mean().item(),
+            "success_event_rate": new_success.float().mean().item(),
+            "success_state_rate": success.float().mean().item(),
         }
         return total
 

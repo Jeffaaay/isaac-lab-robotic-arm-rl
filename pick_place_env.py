@@ -297,13 +297,9 @@ class SO101PickPlaceEnv(DirectRLEnv):
         # ── Update prev height AFTER computing delta ──
         self._prev_cube_height = cube_height.clone()
 
-        # ── Body contact penalty — cube elevated but EE not nearby = rolling on body ──
-        cube_touching_body    = (cube_height > 0.01) & (dist_ee_cube > 0.06)
-        body_contact_penalty  = -2.0 * cube_touching_body.float()
-
         total = (reach_reward + grasp_reward + hold_reward +
                  lift_reward + goal_reward + success_bonus +
-                 vel_penalty + rate_penalty + body_contact_penalty)
+                 vel_penalty + rate_penalty)
 
         total = torch.clamp(total, -10.0, 30.0)
 
@@ -347,7 +343,7 @@ class SO101PickPlaceEnv(DirectRLEnv):
         joint_pos  = torch.clamp(joint_pos, lower, upper)
 
         # Start gripper open
-        joint_pos[:, 5] = self.gripper_high * 0.8
+        joint_pos[:, 5] = self.gripper_high  # fully open
 
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
@@ -387,5 +383,32 @@ class SO101PickPlaceEnv(DirectRLEnv):
         low  = torch.tensor(self.cfg.goal_min, device=self.device)
         high = torch.tensor(self.cfg.goal_max, device=self.device)
 
-        local_goals        = low + (high - low) * torch.rand(num, 3, device=self.device)
+        cube_xy = self.cube.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2]
+
+        # Resample until min XY distance from cube is satisfied
+        local_goals = low + (high - low) * torch.rand(num, 3, device=self.device)
+        for _ in range(10):
+            xy_dist = torch.norm(local_goals[:, :2] - cube_xy, dim=-1)
+            too_close = xy_dist < 0.08
+            if not too_close.any():
+                break
+            resample = low + (high - low) * torch.rand(num, 3, device=self.device)
+            local_goals = torch.where(too_close.unsqueeze(-1), resample, local_goals)
+
+        # Final fallback: pick whichever X direction gives more separation
+        xy_dist = torch.norm(local_goals[:, :2] - cube_xy, dim=-1)
+        too_close = xy_dist < 0.08
+        if too_close.any():
+            cx = cube_xy[too_close, 0]
+            cy = cube_xy[too_close, 1]
+            x_plus  = torch.clamp(cx + 0.10, min=self.cfg.goal_min[0], max=self.cfg.goal_max[0])
+            x_minus = torch.clamp(cx - 0.10, min=self.cfg.goal_min[0], max=self.cfg.goal_max[0])
+            use_plus = (x_plus - cx).abs() >= (x_minus - cx).abs()
+            chosen_x = torch.where(use_plus, x_plus, x_minus)
+            local_goals[too_close, 0] = chosen_x
+            local_goals[too_close, 1] = torch.clamp(cy, min=self.cfg.goal_min[1], max=self.cfg.goal_max[1])
+            local_goals[too_close, 2] = local_goals[too_close, 2].clamp(
+                self.cfg.goal_min[2], self.cfg.goal_max[2]
+            )
+
         self.goals[env_ids] = local_goals + self.scene.env_origins[env_ids]
